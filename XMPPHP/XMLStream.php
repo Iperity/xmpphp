@@ -56,10 +56,6 @@ class XMPPHP_XMLStream {
 	 */
 	protected $parser;
 	/**
-	 * @var string
-	 */
-	protected $buffer;
-	/**
 	 * @var integer
 	 */
 	protected $xml_depth = 0;
@@ -362,8 +358,11 @@ class XMPPHP_XMLStream {
 		$this->reconnect = false;
 		$this->send($this->stream_end);
 		$this->sent_disconnect = true;
-		$this->processUntil('end_stream', 5);
-		$this->disconnected = true;
+		// NATHAN: prevent re-entrance of processUntil
+		// If this method is called from a callback, we are re-entering xml_parse which does not work correctly
+		// $this->processUntil('end_stream', 5);
+		// NATHAN: enable the next line to set $disconnected before actually receiving stream_end
+		// $this->disconnected = true;
 	}
 
 	/**
@@ -425,10 +424,12 @@ class XMPPHP_XMLStream {
 	 *
 	 * @return boolean True when all goes well, false when something fails
 	 */
-	private function __process($maximum = 5, $return_when_received = false)
+	// needs to be overridden for BOSH; cannot be private
+	protected function __process($maximum = 5, $return_when_received = false)
 	{
 		$remaining = $maximum;
-		
+		$buff = '';
+
 		do {
 			$starttime = (microtime(true) * 1000000);
 			$read = array($this->socket);
@@ -441,50 +442,67 @@ class XMPPHP_XMLStream {
 				$secs = 0;
 				$usecs = 0;
 			} else {
-				$usecs = $remaining % 1000000;
+				// NATHAN: don't use % here, as it will convert the operands to integers causing integer overflow.
+				$usecs = fmod($remaining, 1000000);
 				$secs = floor(($remaining - $usecs) / 1000000);
 			}
 			$updated = @stream_select($read, $write, $except, $secs, $usecs);
+			// echo "stream_select returns " . ($updated === FALSE ? "false" : $updated). " timeout = $secs / $usecs\n";
 			if ($updated === false) {
 				$this->log->log("Error on stream_select()",  XMPPHP_Log::LEVEL_VERBOSE);				
 				if ($this->reconnect) {
 					$this->doReconnect();
 				} else {
-					fclose($this->socket);
+					// NATHAN: only fclose if socket not null, set disconnected = false
+					// NATHAN: see http://code.google.com/p/xmpphp/issues/detail?id=53
+					if ($this->socket) fclose($this->socket);
+					$this->disconnected = TRUE;
 					$this->socket = NULL;
 					return false;
 				}
 			} else if ($updated > 0) {
-				$buff = '';
-				do {
-					if ($buff != '') {
-						//disable blocking for now because fread() will
-						// block until the 4k are full if we already
-						// read a part of the packet
-						stream_set_blocking($this->socket, 0);
+				if ($buff != '') {
+					//disable blocking for now because fread() will
+					// block until the 4k are full if we already
+					// read a part of the packet
+					stream_set_blocking($this->socket, 0);
+				}
+				$part = fread($this->socket, 4096);
+				stream_set_blocking($this->socket, 1);
+				// NATHAN: check for feof (when server closes socket)
+				// Note: feof() does not work for sockets with stream_socket_enable_crypto set.
+				// The library will wait forever for a <stream:features>, while ejabberd has actually sent the tag. 
+				$meta = stream_get_meta_data($this->socket);
+				$isEndOfFile = $meta['eof'];
+				if ($part === false || ($part == '' && $isEndOfFile)) {
+					if($this->reconnect) {
+						$this->doReconnect();
+					} else {
+						// NATHAN: only fclose if socket not null, set disconnected = false
+						// NATHAN: see http://code.google.com/p/xmpphp/issues/detail?id=53
+						if ($this->socket) fclose($this->socket);
+						$this->disconnected = TRUE;
+						$this->socket = NULL;
+						return false;
 					}
-					$part = fread($this->socket, 4096);
-					stream_set_blocking($this->socket, 1);
-					if ($part === false) {
-						if($this->reconnect) {
-							$this->doReconnect();
-						} else {
-							fclose($this->socket);
-							$this->socket = NULL;
-							return false;
-						}
-					}
-					$this->log->log("RECV: $part",  XMPPHP_Log::LEVEL_VERBOSE);
-					$buff .= $part;
-				} while (!$this->bufferComplete($buff));
-
+				}
+				$this->log->log("RECV: $part",  XMPPHP_Log::LEVEL_VERBOSE);
+				$buff .= $part;
+			} else {
+				# $updated == 0 means no changes during timeout.
+			}
+	
+			// Complete buffer ?
+			// NATHAN: bufferComplete code did not work when XML tags are split across buffers.
+			// We just pass all the data to xml_parse, which will correctly deal with partial tags.
+			// if ($this->bufferComplete($buff)) { 
 				xml_parse($this->parser, $buff, false);
 				if ($return_when_received) {
 					return true;
 				}
-			} else {
-				# $updated == 0 means no changes during timeout.
-			}
+				$buff = '';
+			// }
+			
 			$endtime = (microtime(true)*1000000);
 			$time_past = $endtime - $starttime;
 			$remaining = $remaining - $time_past;
@@ -555,12 +573,14 @@ class XMPPHP_XMLStream {
 
 		if (array_key_exists($event_key, $this->until_payload)) {
 			$payload = $this->until_payload[$event_key];
-			unset($this->until_payload[$event_key]);
-			unset($this->until_count[$event_key]);
-			unset($this->until[$event_key]);
 		} else {
 			$payload = array();
 		}
+		// NATHAN: release event data even if timeout occurred
+		// See http://code.google.com/p/xmpphp/issues/detail?id=92
+		unset($this->until_payload[$event_key]);
+		unset($this->until_count[$event_key]);
+		unset($this->until[$event_key]);
 
 		return $payload;
 	}
@@ -666,7 +686,8 @@ class XMPPHP_XMLStream {
 				}
 			}
 			foreach($this->idhandlers as $id => $handler) {
-				if(array_key_exists('id', $this->xmlobj[2]->attrs) and $this->xmlobj[2]->attrs['id'] == $id) {
+				// TALKTO: add isset condition
+				if(isset($this->xmlobj[2]->attrs) && array_key_exists('id', $this->xmlobj[2]->attrs) and $this->xmlobj[2]->attrs['id'] == $id) {
 					if($handler[1] === null) $handler[1] = $this;
 					$handler[1]->$handler[0]($this->xmlobj[2]);
 					#id handlers are only used once
